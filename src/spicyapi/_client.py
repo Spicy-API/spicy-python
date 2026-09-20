@@ -42,7 +42,7 @@ ACTIVE_STATES = frozenset({"queued", "running"})
 # imports this module, so reading it the other way round would be a circular import; and the tests
 # load this file as a standalone module with no parent package, where a relative import is bound to
 # fail. Both __init__.py and pyproject read it from here.
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Local ceiling on response bodies. See _read_capped: this number is ours, not the contract's.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
