@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  # Same stance as the other repositories: pushes to main do not trigger a run (Actions bills by
+  # the minute); verification happens on pull requests and at release time.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor matches requires-python; the ceiling tracks the current stable release. The
+        # syntax differences between them are where things actually break - testing only the newest
+        # would leave problems for users on 3.11 to discover themselves.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Contract drift
+        # Compares against the public contract and needs no credentials - this repository is
+        # public and must not hold a token that can read a private one.
+        run: python scripts/check_contract.py
+      - name: README examples
+        # A broken README example turns no test red - the library is correct and only the docs are
+        # wrong, while whoever copies them hits an AttributeError. A guard that never runs is not a
+        # guard.
+        run: python scripts/check_readme.py
+      - name: Lint
+        run: pipx run ruff check .
+      - name: Build
+        run: pipx run build

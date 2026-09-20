@@ -1,0 +1,29 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # PyPI trusted publishing exchanges OIDC for upload credentials, so no long-lived token is
+  # stored in this repository. An API token kept in a secret, once leaked, lets anyone publish
+  # under this package name until it is revoked.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # Re-run the full verification before releasing. Bumping a version without running the tests
+      # means pushing something unverified to a place it cannot be recalled from - a PyPI version
+      # number, once used, can never be reused.
+      - run: python -m unittest discover -s tests -p 'test_*.py'
+      - run: python scripts/check_contract.py
+      - run: pipx run build
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,2309 @@
+openapi: 3.1.0
+info:
+  title: SpicyAPI Public API
+  version: 1.0.0
+  description: |
+    Contract for the implemented `/api/v1` integration surface.
+
+    Every operation requires a Bearer API key. Every JSON response uses the
+    `{code,msg,data,request_id}` envelope. A successful HTTP response has
+    `code: 200`; asynchronous task success or failure is expressed by
+    `data.state`, not by the envelope code.
+
+    The `/v1` operations tagged `OpenAI Compatible` are the one documented
+    exception: they return OpenAI / Anthropic response and error objects so
+    the official SDKs work by changing only `base_url`.
+
+    Error text language: `msg`, task `errorMessage` and the compatible
+    layers' `error.message` are English by default. Send `Accept-Language`
+    (`en`, `ja`, `ko`, `de`, `fr`, `es`, `pt-BR`, `ru`, `it`, `pl`; regional
+    variants such as `de-DE` match their language, while Chinese tags and `*`
+    match nothing) to choose another language for one request, or set the
+    account's API error language in the console; a recognized header takes
+    precedence.
+    Webhooks follow the account setting. Error responses carry
+    `Content-Language`. Codes (`code`, `errorCode`, OpenAI `type` / `code`,
+    Gemini `code` / `status`) never change with the language, so branch on
+    codes, not on text. When a generation fails for a reason reported by the
+    model service, task `errorMessage` and the compatible layers'
+    `error.message` carry that reason in English (not translated), with
+    internal identifiers and account details removed.
+servers:
+  - url: https://api.spicyapi.ai
+    description: Production
+tags:
+  - name: Tasks
+  - name: Models
+  - name: Account
+  - name: Media
+  - name: OpenAI Compatible
+    description: >-
+      OpenAI / Anthropic protocol shells under `/v1` and the Google Gemini shell under `/v1beta`.
+      They share API keys, limits, validation and billing with `/api/v1` but use the external
+      protocol's own request, response and error shapes. On these paths the API key may be sent as
+      `Authorization: Bearer <key>`, `x-api-key: <key>` (Anthropic SDKs) or
+      `x-goog-api-key: <key>` (Google GenAI SDKs); `/api/v1` accepts only `Authorization: Bearer`.
+      Keys in the URL query string are never accepted.
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/jobs/quote:
+    post:
+      tags: [Tasks]
+      operationId: quoteTask
+      summary: Quote a task before reserving funds
+      description: |
+        Validates the same model input and admission rules as task creation,
+        without creating a task, reserving funds or starting generation.
+        The signed quote is bound to this account, API key and request and is
+        valid for five minutes. Pass quoteId and expectedCost with the same
+        request to createTask or jobs/stream. New acceptance rejects an expired
+        or changed quote with business code 40901. A replay of an already
+        accepted Idempotency-Key still returns the original task.
+        A quote does not reserve capacity or guarantee future availability.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskRequest' }
+      responses:
+        '200':
+          description: Customer price and maximum charge; no funds were reserved.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskQuoteEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/jobs/createTask:
+    post:
+      tags: [Tasks]
+      operationId: createTask
+      summary: Create an asynchronous generation task
+      description: |
+        Validates the model input, reserves the estimated charge, chooses an
+        available deployment, and creates a task in `queued` state. HTTP 202
+        means the task was accepted; it does not mean generation has completed.
+
+        An `Idempotency-Key` is optional but strongly recommended. For the same
+        account **and the same API key**, repeating a key with the same normalized
+        model, input, and callback URL within 24 hours returns the
+        original task and does not reserve funds twice. A sibling API key cannot
+        replay the mapping: it receives `409 Conflict` without the original task
+        ID. Reusing the key with different request semantics also returns
+        `409 Conflict`. Callbacks are optional and are validated against
+        private/loopback destinations before acceptance.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SpicyRetention'
+        - name: wait
+          in: query
+          required: false
+          description: |
+            Seconds to hold the connection open waiting for the task to reach a
+            terminal state, so you do not have to write a polling loop for the
+            first call. Values above 60 are clamped to 60; anything that is not a
+            positive integer is ignored rather than rejected, because a typo in an
+            optimisation parameter should not fail a generation that would
+            otherwise succeed.
+
+            Reaching a terminal state within the budget returns `200` with the
+            same task record `recordInfo` returns. Running out of budget returns
+            the ordinary `202` — identical to omitting `wait` — and you poll from
+            there. Disconnecting stops the wait and nothing else: the task keeps
+            running and is billed as usual.
+
+            The ceiling stays well under the 100-second edge timeout on purpose.
+            Past that line the connection is cut by the CDN rather than by us, and
+            the caller gets a `524` carrying neither the task ID nor any resumable
+            state — while the task exists and the funds are already held.
+          schema: { type: integer, minimum: 1, maximum: 60 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '200':
+          description: Returned only when `wait` was supplied and the task reached a terminal state inside that budget. The body is the task record, identical in shape to `recordInfo`. A terminal state is not necessarily a success - check `data.state`.
+          headers:
+            Cache-Control:
+              description: Task records contain caller-specific state and must not be cached.
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecordEnvelope'
+        '202':
+          description: A newly accepted task is returned in `queued` state. A same-key idempotent replay returns the original task in its current state and does not create another hold. The hold is not a charge.
+          headers:
+            Location:
+              description: Relative URL of the task status resource.
+              schema: { type: string }
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+            Cache-Control:
+              description: Task submissions contain caller-specific state and must not be cached.
+              schema: { type: string, const: no-store }
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTaskEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+      callbacks:
+        onTaskTerminal:
+          '{$request.body#/callBackUrl}':
+            post:
+              summary: Deliver a terminal task record
+              description: |
+                Sent only when `callBackUrl` was supplied. New integrations use
+                payload version 2, whose body is the same envelope and task
+                record returned by `recordInfo`. Payload version 1 remains a
+                compatibility output and is selected by the version header.
+
+                Verify `X-Webhook-Signature` over
+                `taskId.timestamp.sha256(raw_body)` with HMAC-SHA256 and the
+                account webhook key. Select `taskId` from top-level `task_id`
+                for payload v1 and from `data.taskId` for payload v2, then
+                compare the Base64-encoded result in constant time.
+                Reject stale timestamps. A delivery may be retried and receivers
+                must be idempotent; in v2, `request_id` is the stable delivery ID.
+              parameters:
+                - name: X-Webhook-Timestamp
+                  in: header
+                  required: true
+                  schema: { type: string, pattern: '^[0-9]+$' }
+                  description: Unix timestamp used by the signature.
+                - name: X-Webhook-Signature
+                  in: header
+                  required: true
+                  schema: { type: string }
+                  description: Base64-encoded HMAC-SHA256 signature.
+                - name: X-Webhook-Payload-Version
+                  in: header
+                  required: true
+                  schema: { type: integer, enum: [1, 2] }
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      oneOf:
+                        - $ref: '#/components/schemas/TaskRecordEnvelope'
+                        - $ref: '#/components/schemas/LegacyWebhookPayload'
+              responses:
+                '200':
+                  description: Any 2xx response acknowledges delivery.
+  /api/v1/jobs/recordInfo:
+    get:
+      tags: [Tasks]
+      operationId: recordInfo
+      summary: Get a task created by the authenticated API key
+      parameters:
+        - name: taskId
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Current task record. Terminal and non-terminal states share this shape.
+          headers:
+            Cache-Control:
+              description: Task state is caller-specific and changes asynchronously.
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecordEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Task does not exist or belongs to another account or API key; these cases are indistinguishable.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/jobs/stream:
+    post:
+      tags: [Tasks]
+      operationId: streamTask
+      summary: Run a text model and stream the answer
+      description: |
+        Text models only. Applies the same validation, quota, pricing and hold as
+        `createTask`, then keeps the connection open and returns the model answer
+        as a Server-Sent Events stream. Each event is a `data:` line carrying one
+        JSON chunk; the stream ends with `data: [DONE]`.
+
+        The hold is settled when the stream completes. If generation fails
+        before the first event, the response is a normal JSON error and the hold is
+        released. If it fails mid-stream the connection is terminated with an
+        `error` event and the hold is still released — a truncated answer is never
+        charged as a completed one.
+
+        Generation models (image, video, audio) are asynchronous and must use
+        `createTask` with `recordInfo` polling; calling this endpoint for them
+        returns `503`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SpicyRetention'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '200':
+          description: Server-Sent Events stream of the model answer.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /api/v1/jobs/retry:
+    post:
+      tags: [Tasks]
+      operationId: retryTask
+      summary: Create a new task from a failed or expired task
+      description: |
+        The source terminal task is never modified. Current model schema,
+        pricing, permissions, balance, and availability are evaluated again. An
+        optional Idempotency-Key is scoped to the source task and retry action.
+        The source task must have been created by the same API key; unknown,
+        cross-account, and same-account cross-key task IDs all return 404.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskActionRequest' }
+      responses:
+        '200':
+          description: A newly created retry task is returned in `queued` state. An idempotent replay returns that retry task in its current state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetryTaskEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/jobs/purge:
+    post:
+      tags: [Tasks]
+      operationId: purgeTask
+      summary: Destroy the stored content of a finished task
+      description: |
+        Removes the task's generated media objects, its result payload, and the
+        stored request text including the prompt.
+
+        **Billing evidence is never touched.** The ledger, the charged amount,
+        the model identifier, the state, the timestamps and the request_id all
+        remain, so the task stays fully auditable in billing. What is destroyed
+        is the content, not the spend record; the response repeats this as
+        `billingRetained`.
+
+        Only a finished task can be destroyed; a task that is still queued or
+        running returns 400. Its outputs have not landed yet, and removing half
+        of them is worse than removing none. An accepted generation task cannot
+        be stopped, so the only thing to do is wait for it to reach a terminal
+        state and call this endpoint then.
+
+        The call is idempotent by `taskId`: destroying an already destroyed task
+        returns 200 with the original `purgedAt`, so a client may safely retry
+        after a timeout. This endpoint does not read an `Idempotency-Key` header;
+        the `taskId` itself is the idempotency key.
+
+        Media objects are removed by a background sweep within about a minute,
+        so `mediaDeletionPending` can be true while `contentState` is already
+        `purged`. Deleting them inline would let one undeletable object block the
+        whole request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskActionRequest' }
+      responses:
+        '200':
+          description: Content destroyed, or already destroyed by an earlier call.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPurgeEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/models:
+    get:
+      tags: [Models]
+      operationId: listModels
+      summary: List callable models and account-specific prices
+      description: |
+        Returns all enabled models without pagination. The response is private
+        because prices include the authenticated account's group multiplier.
+        The server sends `Cache-Control: private, max-age=60`.
+      parameters:
+        - name: modality
+          in: query
+          schema: { type: string, enum: [image, video, audio, text] }
+        - name: provider
+          in: query
+          schema: { type: string }
+          description: Exact model creator/author identifier, such as the research lab that built the model.
+        - name: task
+          in: query
+          schema: { type: string }
+          description: >-
+            Exact supported task, for example `text-to-image`. Image editing accepts either spelling:
+            `edit` (the published call suffix) and `image-to-image` (the value returned in `tasks`)
+            select the same endpoints.
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 128 }
+        - name: includeSchema
+          in: query
+          schema:
+            oneOf:
+              - { type: boolean }
+              - { type: integer, enum: [0, 1] }
+          description: Include each model's input JSON Schema when `true` or `1`.
+        - name: includeExamples
+          in: query
+          schema:
+            oneOf:
+              - { type: boolean }
+              - { type: integer, enum: [0, 1] }
+          description: Include validated example inputs when `true` or `1`.
+      responses:
+        '200':
+          description: Model list.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, max-age=60' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelListEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/models/{model}:
+    get:
+      tags: [Models]
+      operationId: getModel
+      summary: Get one model, including its input JSON Schema
+      description: |
+        `model` is the exact value used by `createTask.model` and may contain
+        slashes. URL-encode embedded slashes when using clients that treat path
+        parameters as one segment (for example `family%2Fversion%2Ftask`).
+      parameters:
+        - name: model
+          in: path
+          required: true
+          allowReserved: true
+          schema: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Complete model record.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, max-age=60' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /console/v1/catalog/models:
+    get:
+      tags: [Models]
+      operationId: listPublicCatalog
+      summary: Anonymous evaluation catalogue (no API key)
+      security: []
+      description: |
+        The one integration-relevant path that reads without credentials. It
+        exists so that "which models are there and what do they cost" can be
+        answered before signing up, which is the order integrations actually
+        evaluate in.
+
+        Use it while evaluating; use `GET /api/v1/models` once you hold a key.
+        The authenticated catalogue is still the only source for callable model
+        IDs at integration time: it is scoped to the key, carries the account's
+        group multiplier, the full input JSON Schema and validated examples,
+        and it is the surface `createTask.model` is contractually tied to.
+        This one is public, cached at the edge and priced at the standard rate.
+
+        Each item carries both `model` and `slug` with the same value, so
+        parsing code written here keeps working against `/api/v1/models`.
+
+        The complete item shape (marketing copy, assets, family routing) is
+        documented in `console-openapi.yaml`; the fields below are the ones an
+        integration cares about, and the object carries more.
+      parameters:
+        - name: locale
+          in: query
+          schema: { type: string, enum: [en, ja, ko, de, fr, es, 'pt-BR', ru, it, pl], default: en }
+          description: >-
+            Content language. Defaults to `en` when omitted. An unsupported
+            value is rejected with 400 rather than silently falling back.
+        - name: strict
+          in: query
+          schema:
+            oneOf:
+              - { type: boolean }
+              - { type: integer, enum: [0, 1] }
+          description: >-
+            When `1` or `true`, return only models whose copy is published in
+            that exact locale, with no fallback. Sitemap generation needs this;
+            integrations normally do not.
+      responses:
+        '200':
+          description: Published catalogue for one locale.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'public, max-age=60, s-maxage=300, stale-while-revalidate=86400' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicCatalogEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/jobs:
+    get:
+      tags: [Tasks]
+      operationId: listTasks
+      summary: List task history for the authenticated API key
+      description: |
+        Returns only visible tasks created by this API key, newest first by
+        createdAt and taskId. Scope is this API key: tasks created by other keys on the same account, and generations started directly in the web console (which use no API key), are not included. For an account-wide view, use the console's usage page. The list contains metadata only;
+        use recordInfo for a selected task's result. No input, output, signed
+        media URL, or internal processing detail is included.
+        Dates form a UTC half-open interval [from,to), up to 92 days.
+        Default to is tomorrow in UTC; omitted from is seven days before to.
+        Keep all filters, including explicit from/to dates, unchanged while
+        paginating with nextCursor. Pages read live state, not a frozen snapshot.
+        Unknown, duplicate, or empty query parameters are rejected. Queries
+        have a five-second server budget and return 503 on timeout.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+          description: Inclusive UTC date in YYYY-MM-DD format.
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+          description: Exclusive UTC date in YYYY-MM-DD format.
+        - name: state
+          in: query
+          schema: { type: string, enum: [queued, running, succeeded, failed, canceled, expired] }
+        - name: model
+          in: query
+          schema: { type: string }
+          description: Exact catalog model identifier or a declared alias.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Opaque nextCursor from the previous page; do not construct it yourself.
+      responses:
+        '200':
+          description: Current-key task summaries without prompt or result payloads.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIKeyTaskListEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/usage:
+    get:
+      tags: [Account]
+      operationId: getUsage
+      summary: Get usage for the authenticated API key
+      description: |
+        Scope is this API key: tasks created by other keys on the same account, and generations started directly in the web console (which use no API key), are not included. For an account-wide view, use the console's usage page.
+        Hidden historical tasks of this key are included. Other keys and
+        workspaces cannot be selected. Unknown or repeated query parameters
+        are rejected.
+        Dates form a UTC half-open interval [from,to), up to 92 days.
+        The default to is tomorrow in UTC; omitted from is seven days before to.
+        Calls are attributed to task creation time. Spend sums only settled
+        actual charges for those tasks, never pending holds. Late settlement
+        can change a previous day's spend. These are task usage totals, not
+        a statement of cash movements or remaining API-key budget.
+        An additional account-wide token bucket allows a burst of 30 requests
+        and replenishes 30 tokens per minute, shared by all keys on the account.
+        Observe Retry-After on 429. This reporting limit fails closed when its
+        limiter is unavailable. Queries have a five-second server budget;
+        a timeout returns 503 and suggests retrying a shorter date range.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+          description: Inclusive UTC date in YYYY-MM-DD format.
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+          description: Exclusive UTC date in YYYY-MM-DD format.
+      responses:
+        '200':
+          description: Current-key usage with exact USD decimal strings and sparse daily/model buckets.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIKeyUsageEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/chat/credit:
+    get:
+      tags: [Account]
+      operationId: getCreditBalance
+      summary: Get net balance, promotional grants, and approved credit
+      responses:
+        '200':
+          description: Net available, held, and total balances plus funding sources in USD decimal strings. Unused credit is separate from wallet funds; model-scoped grants may not pay for every request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceEnvelope'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/common/upload-url:
+    post:
+      tags: [Media]
+      operationId: createUploadUrl
+      summary: Create a presigned image upload ticket
+      description: |
+        The server generates the object key. Upload the exact declared number of
+        bytes with PUT and copy every returned header. Supported media types are
+        JPEG, PNG, WebP and GIF images (10 MiB), or MP4/WebM video and
+        MP3/WAV audio (90 MiB, at most 600 seconds). Audio/video commit verifies
+        format and measurable duration; it does not inspect adult content. After PUT,
+        call the file commit endpoint and use its spicy:// URI in task input.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadURLRequest'
+      responses:
+        '200':
+          description: Presigned upload ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadURLEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/files/{fileId}/commit:
+    post:
+      tags: [Media]
+      operationId: commitUploadedFile
+      summary: Commit a completed direct upload
+      description: |
+        Compares the stored byte count and media type with the ticket, checks
+        the image signature, computes SHA-256, and copies the temporary object
+        to an immutable private key. Reference this uploaded file with the returned
+        spicy:// URI. Publicly accessible HTTPS media URLs can instead be passed
+        directly in supported model input fields, without uploading. Repeating
+        a successful commit is idempotent.
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^fil_' }
+      responses:
+        '200':
+          description: Ready tenant-scoped file reference.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileCommitEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/v1/common/download-url:
+    post:
+      tags: [Media]
+      operationId: createDownloadUrl
+      summary: Create a short-lived task output download URL
+      description: |
+        The server verifies both task ownership and that the requested key is an
+        output of that task. Leave `key` empty to select the first output.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadURLRequest'
+      responses:
+        '200':
+          description: Short-lived download ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadURLEnvelope'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  # ── OpenAI / Anthropic compatible surface ──────────────────────────────
+  # These operations use the response shapes of the external protocols they
+  # imitate (OpenAI error objects, Anthropic error objects, SSE event streams)
+  # instead of the `{code,msg,data,request_id}` envelope. Authentication, rate
+  # limits, validation, pricing and holds are shared with `/api/v1`.
+  /v1/models:
+    get:
+      tags: [OpenAI Compatible]
+      operationId: listOpenAIModels
+      summary: List callable models in the OpenAI `model` list shape
+      description: |
+        Returns every model that can be called right now. `id` is the SpicyAPI
+        model identifier accepted by every `/v1` and `/api/v1` operation;
+        `owned_by` is the model publisher (for example a research lab).
+        Pricing is not included; use `/api/v1/models`.
+      responses:
+        '200':
+          description: OpenAI-style model list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIModelList'
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/chat/completions:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createChatCompletion
+      summary: OpenAI Chat Completions on a SpicyAPI text model
+      description: |
+        Accepts an OpenAI Chat Completions request. `messages`, `tools`,
+        `tool_choice`, `response_format`, `max_tokens` (or
+        `max_completion_tokens`), `temperature` and `top_p` map onto the
+        model's public input fields of the same name; `stream`,
+        `stream_options`, `user`, `metadata` and `store` are handled by this
+        layer. Any other parameter is forwarded to the model's input schema
+        and rejected with `400` when the model does not declare it — a
+        parameter is never dropped silently.
+
+        `stream: true` returns a Server-Sent Events stream of
+        `chat.completion.chunk` objects terminated by `data: [DONE]`.
+        `stream: false` returns one `chat.completion` object. The same hold,
+        settlement and refund rules as `/api/v1/jobs/stream` apply.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: One `chat.completion` object, or an SSE stream when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletion'
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '413': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/responses:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createResponse
+      summary: OpenAI Responses API subset on a SpicyAPI text model
+      description: |
+        Accepts the stateless subset of the OpenAI Responses API: `model`,
+        `input` (string or item array with `message`, `function_call` and
+        `function_call_output` items), `instructions`, `max_output_tokens`,
+        `temperature`, `top_p`, `tools` (function tools), `tool_choice`,
+        `text.format`, `reasoning.effort` and `stream`. The request is
+        translated to a chat completion internally. `previous_response_id`
+        is rejected with `400`; send the full history in `input` instead.
+
+        Non-streaming calls return a `response` object with `output[]`
+        (`message` and `function_call` items) and `usage`. Streaming calls
+        emit `response.created`, `response.output_text.delta` and
+        `response.completed` events.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: One `response` object, or an SSE stream when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponseObject'
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '413': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/messages:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createMessage
+      summary: Anthropic Messages API on a SpicyAPI text model
+      description: |
+        Accepts an Anthropic Messages request (`model`, `system`, `messages`
+        with text / image / tool_use / tool_result blocks, `max_tokens`,
+        `temperature`, `top_p`, `stop_sequences`, `tools`, `tool_choice`,
+        `stream`) and translates it to a chat completion internally.
+        Non-streaming calls return an Anthropic `message` object. Streaming
+        calls emit `message_start`, `content_block_start`,
+        `content_block_delta`, `content_block_stop`, `message_delta` and
+        `message_stop` events. Errors use the Anthropic
+        `{type:"error",error:{type,message}}` shape.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnthropicMessageRequest'
+      responses:
+        '200':
+          description: One Anthropic `message` object, or an SSE stream when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnthropicMessage'
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/AnthropicError' }
+        '401': { $ref: '#/components/responses/AnthropicError' }
+        '402': { $ref: '#/components/responses/AnthropicError' }
+        '403': { $ref: '#/components/responses/AnthropicError' }
+        '404': { $ref: '#/components/responses/AnthropicError' }
+        '409': { $ref: '#/components/responses/AnthropicError' }
+        '413': { $ref: '#/components/responses/AnthropicError' }
+        '429': { $ref: '#/components/responses/AnthropicError' }
+        '500': { $ref: '#/components/responses/AnthropicError' }
+        '503': { $ref: '#/components/responses/AnthropicError' }
+
+  /v1beta/models/{model}:generateContent:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: geminiGenerateContent
+      summary: Google Gemini generateContent on a SpicyAPI text model
+      description: |
+        Accepts a Google Gemini `generateContent` request (`contents` with
+        text / inlineData / functionCall / functionResponse parts,
+        `systemInstruction`, `tools.functionDeclarations`, `toolConfig`,
+        `generationConfig` such as `temperature`, `topP`, `maxOutputTokens`,
+        `stopSequences`, `responseMimeType`, `responseSchema`,
+        `thinkingConfig`). `{model}` is a SpicyAPI text model identifier from
+        `/v1/models` and may contain a slash (for example
+        `google/gemini-3-flash-preview`). Validation, pricing and availability are
+        identical to `/v1/chat/completions`. The response is one
+        `GenerateContentResponse`. Errors use the Google
+        `{error:{code,message,status}}` shape.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeminiGenerateContentRequest'
+      responses:
+        '200':
+          description: One `GenerateContentResponse`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeminiGenerateContentResponse'
+        '400': { $ref: '#/components/responses/GeminiError' }
+        '401': { $ref: '#/components/responses/GeminiError' }
+        '402': { $ref: '#/components/responses/GeminiError' }
+        '403': { $ref: '#/components/responses/GeminiError' }
+        '404': { $ref: '#/components/responses/GeminiError' }
+        '409': { $ref: '#/components/responses/GeminiError' }
+        '413': { $ref: '#/components/responses/GeminiError' }
+        '429': { $ref: '#/components/responses/GeminiError' }
+        '500': { $ref: '#/components/responses/GeminiError' }
+        '503': { $ref: '#/components/responses/GeminiError' }
+
+  /v1beta/models/{model}:streamGenerateContent:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: geminiStreamGenerateContent
+      summary: Google Gemini streamGenerateContent on a SpicyAPI text model
+      description: |
+        Same request as `generateContent`. With `?alt=sse` (what the Google
+        GenAI SDKs send) the response is a server-sent event stream where each
+        `data:` line is one `GenerateContentResponse`; the final one carries
+        `finishReason` and `usageMetadata`. There is no `[DONE]` sentinel.
+        Without `alt=sse` the response is a JSON array of
+        `GenerateContentResponse` objects written progressively.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: { type: string }
+        - name: alt
+          in: query
+          required: false
+          schema: { type: string, enum: [sse] }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeminiGenerateContentRequest'
+      responses:
+        '200':
+          description: An SSE stream (`alt=sse`) or a JSON array of `GenerateContentResponse`.
+          content:
+            text/event-stream:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GeminiGenerateContentResponse' }
+        '400': { $ref: '#/components/responses/GeminiError' }
+        '401': { $ref: '#/components/responses/GeminiError' }
+        '402': { $ref: '#/components/responses/GeminiError' }
+        '403': { $ref: '#/components/responses/GeminiError' }
+        '404': { $ref: '#/components/responses/GeminiError' }
+        '409': { $ref: '#/components/responses/GeminiError' }
+        '413': { $ref: '#/components/responses/GeminiError' }
+        '429': { $ref: '#/components/responses/GeminiError' }
+        '500': { $ref: '#/components/responses/GeminiError' }
+        '503': { $ref: '#/components/responses/GeminiError' }
+
+  /v1/videos:
+    post:
+      tags: [OpenAI Compatible]
+      operationId: createVideo
+      summary: Create a video generation task in the OpenAI Videos shape
+      description: |
+        Projection of `createTask` onto the OpenAI Videos API. `model` must be
+        a video endpoint identifier from `/v1/models`. `prompt` maps to the
+        model's `prompt`; `input_reference` (an HTTPS URL or a committed
+        `spicy://` upload) maps to `image_url` / `image_urls`; `seconds` maps to
+        `duration_seconds`; `size` (`WIDTHxHEIGHT`) maps to `resolution` and/or
+        `aspect_ratio`, or to `width` / `height` when the model declares pixel
+        dimensions. A parameter the selected model does not declare is
+        rejected with `400`. The same hold and idempotency rules as
+        `createTask` apply; the returned object never contains prices.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VideoCreateRequest'
+      responses:
+        '200':
+          description: The accepted task as a `video` object in `queued` state (an idempotent replay reports the current state).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Video'
+        '400': { $ref: '#/components/responses/OpenAIError' }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '402': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '413': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/videos/{videoId}:
+    get:
+      tags: [OpenAI Compatible]
+      operationId: retrieveVideo
+      summary: Retrieve a video task as an OpenAI `video` object
+      description: |
+        Task states map to `queued` → `queued`, `running` → `in_progress`,
+        `succeeded` → `completed`, and `failed` / `canceled` / `expired` →
+        `failed` with an `error` object. Only the account and API key that
+        created the task can read it; other identifiers return `404`.
+      parameters:
+        - name: videoId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Current video task state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Video'
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+  /v1/videos/{videoId}/content:
+    get:
+      tags: [OpenAI Compatible]
+      operationId: downloadVideoContent
+      summary: Redirect to the generated video file
+      description: |
+        Responds `302 Found` with a short-lived signed download URL for the
+        task's primary output, the same address `/api/v1/common/download-url`
+        would issue. `409` while the task is still queued or running; `404`
+        when the task failed or has no downloadable output.
+      parameters:
+        - name: videoId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirect to the signed media URL. The redirect must not be cached.
+          headers:
+            Location:
+              description: Short-lived signed download URL.
+              schema: { type: string, format: uri }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+        '401': { $ref: '#/components/responses/OpenAIError' }
+        '403': { $ref: '#/components/responses/OpenAIError' }
+        '404': { $ref: '#/components/responses/OpenAIError' }
+        '409': { $ref: '#/components/responses/OpenAIError' }
+        '429': { $ref: '#/components/responses/OpenAIError' }
+        '500': { $ref: '#/components/responses/OpenAIError' }
+        '503': { $ref: '#/components/responses/OpenAIError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: 'sk-spicy-<48 lowercase hex characters>'
+      description: 'Send `Authorization: Bearer sk-spicy-...`. Keep keys server-side.'
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Stable key for one logical task submission; retained for 24 hours per account and bound to both the submitting API key and normalized request fingerprint. A sibling key receives 409 without the original task ID.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    SpicyRetention:
+      name: X-Spicy-Retention
+      in: header
+      required: false
+      description: >-
+        Retention for this one task, in whole seconds. It applies to both the
+        generated outputs and the stored request text. The effective value is
+        always `min(header, account setting, platform maximum)`: a request can
+        only shorten retention, never extend it.
+
+        `0` is valid and means the outputs are removed as soon as the task
+        reaches a terminal state. Values that cannot be applied never fail the
+        request: a negative number is clamped to `0`, a value above the ceiling
+        is clamped to the ceiling, and a value that is not a decimal integer is
+        ignored so the account setting applies. The effective result is always
+        reported back in `retention` on the task record.
+
+        Accepted by `createTask` and `stream`. `retry` inherits the source
+        task's effective value and ignores this header, so one task family never
+        ends up with two different expiry times. `quote` does not accept it
+        because it does not create a task.
+      schema: { type: string, pattern: '^-?[0-9]+$' }
+  headers:
+    RateLimitLimit:
+      description: Capacity of the active account-level rate-limit window.
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Remaining requests in the active window.
+      schema: { type: integer }
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 1 }
+  responses:
+    BadRequest:
+      description: >-
+        Invalid JSON, query, callback URL, model input, or media declaration.
+        Invalid callBackUrl values return code 400 and msg "Invalid callback URL"
+        with request_id. Submitted hosts, IP addresses, and DNS diagnostics are not echoed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Unauthorized:
+      description: Missing, malformed, expired, revoked, or otherwise invalid API key.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    PaymentRequired:
+      description: Insufficient balance (`40201`) or a spend cap was reached (`40202`).
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Forbidden:
+      description: Account, model, API-key, IP, or region authorization failed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    NotFound:
+      description: Resource does not exist or is not visible to this account and API key. These cases are intentionally indistinguishable.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Conflict:
+      description: Idempotency or media-transfer state conflicts with this request.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    PayloadTooLarge:
+      description: Request body exceeds the server's accepted size limit.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    RateLimited:
+      description: Account-level request limit exceeded.
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    ServerError:
+      description: Internal failure. Details are not exposed; report `request_id` to support.
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Unavailable:
+      description: >-
+        HTTP 503 carries one of three business codes. `50301`: no usable deployment or effective customer price
+        exists for the selected model. `503`: a dependency is temporarily unavailable; retry after the
+        `Retry-After` header when it is present. `50302`: a synchronous generation failed upstream and the charge
+        was refunded. Nothing was charged, but send the retry with a **new** `Idempotency-Key`: reusing the
+        original one replays the recorded failure instead of generating again.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    OpenAIError:
+      description: Error in the OpenAI `{error:{message,type,param,code}}` shape. The HTTP status is the same one `/api/v1` would return.
+      content: { application/json: { schema: { $ref: '#/components/schemas/OpenAIErrorBody' } } }
+    AnthropicError:
+      description: Error in the Anthropic `{type:"error",error:{type,message}}` shape.
+      content: { application/json: { schema: { $ref: '#/components/schemas/AnthropicErrorBody' } } }
+    GeminiError:
+      description: Error in the Google `{error:{code,message,status}}` shape. `status` is the google.rpc code name (for example `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `RESOURCE_EXHAUSTED`).
+      content: { application/json: { schema: { $ref: '#/components/schemas/GeminiErrorBody' } } }
+  schemas:
+    FundingGrantItem:
+      type: object
+      required: [id, name, amountUsd, availableUsd, heldUsd, spentUsd, status, startsAt, modelSlugs, customerMemo, createdAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        amountUsd: { type: string }
+        availableUsd: { type: string }
+        heldUsd: { type: string }
+        spentUsd: { type: string }
+        status: { type: string }
+        startsAt: { type: string, format: date-time }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        modelSlugs: { type: array, items: { type: string }, description: Empty means all models. }
+        customerMemo: { type: string }
+        createdAt: { type: string, format: date-time }
+    CreditFacilityItem:
+      type: object
+      required: [enabled, limitUsd, availableUsd, usedUsd, heldUsd, status, version]
+      properties:
+        enabled: { type: boolean }
+        limitUsd: { type: string, description: Approved ceiling, not wallet funds. }
+        availableUsd: { type: string }
+        usedUsd: { type: string, description: Outstanding settled principal. }
+        heldUsd: { type: string, description: Credit reserved for accepted tasks. }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        status: { type: string }
+        version: { type: integer, format: int64 }
+    FundingOverview:
+      type: object
+      required: [balanceUsd, heldUsd, prepaidAvailableUsd, grantAvailableUsd, cashShortfallUsd, credit, grants, grantsHasMore]
+      properties:
+        balanceUsd: { type: string, description: Net wallet available balance; may be negative for approved credit consumption or external payment recovery. }
+        heldUsd: { type: string }
+        prepaidAvailableUsd: { type: string, description: Unrestricted prepaid or legacy available funds. }
+        grantAvailableUsd: { type: string, description: Active available grants; model applicability is checked at task admission. }
+        cashShortfallUsd: { type: string, description: External payment recovery shortfall that cannot be covered by grants or credit. }
+        credit: { $ref: '#/components/schemas/CreditFacilityItem' }
+        grants: { type: array, items: { $ref: '#/components/schemas/FundingGrantItem' } }
+        grantsHasMore: { type: boolean }
+
+    EnvelopeBase:
+      type: object
+      required: [code, msg, request_id]
+      properties:
+        code: { type: integer }
+        msg: { type: string }
+        request_id:
+          type: string
+          description: Correlation identifier. Include it in support requests.
+    ErrorEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          properties:
+            code:
+              type: integer
+              enum: [400, 40003, 40004, 401, 40201, 40202, 403, 40301, 40302, 40303, 404, 409, 40901, 413, 429, 500, 503, 50301, 50302]
+              description: >-
+                Business code. `40003`: an uploaded file's actual size, media type or signature does not match its
+                upload ticket (file commit). `40004`: the request is valid but no deployment can serve this exact
+                parameter combination; change the named parameter and retry. `503`: a dependency is temporarily
+                unavailable (for example a list or usage query timed out, or inline image storage failed); honour
+                `Retry-After` when present. `50301`: the model has no usable deployment or effective price right now.
+                `50302`: a synchronous generation (streaming) failed upstream and the charge was refunded. Retry with a
+                **new** `Idempotency-Key` — the original key replays the same failure, so a transport-level retry
+                that keeps the key can never succeed.
+                `40301`: this key is not allowed to call this model — check the key's model restrictions in the
+                Console. `40302`: the caller's address is not in this key's IP allow-list. `40303`: the request
+                comes from a region this service is not offered in; the message deliberately does not state how
+                that is determined, and neither does this description.
+            msg:
+              type: string
+              description: Human-readable explanation, English unless `Accept-Language` or the account's API error language selects another supported language. Never parse it; branch on `code`.
+    CreateTaskRequest:
+      type: object
+      required: [model, input]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Exact `model` value from the model catalog.
+        input:
+          type: object
+          description: >-
+            Validated against the selected model's inputSchema. Declared image fields accept
+            public HTTPS URLs, committed spicy:// file URIs, or standard Base64 Data URIs
+            (image/jpeg, image/png, image/webp, image/gif). Inline images are limited to
+            1048576 decoded bytes and 8388608 pixels each, 8192 pixels per side, and
+            16 images / 16777216 pixels in total. The complete JSON request must fit within
+            2097152 bytes. Model-specific limits still apply. Bare Base64, SVG and inline
+            audio/video are not accepted; use HTTPS or file uploads instead. Inline images
+            are stored as account-bound uploaded files; returned input contains file URIs,
+            never the original Base64 bytes. Quote validation does not upload or reserve funds.
+          additionalProperties: true
+        callBackUrl:
+          type: string
+          format: uri
+          description: >-
+            Optional public HTTPS endpoint for terminal task delivery. `http://` URLs are rejected: the delivery
+            carries the prompt and signed result links. Explicit ports other than 443 and 80 are rejected, and
+            URL credentials are rejected.
+            The hostname must resolve to public IP addresses and is checked again when connecting.
+            Invalid values return HTTP 400 with code 400, msg "Invalid callback URL", and request_id.
+        quoteId:
+          type: string
+          maxLength: 4096
+          description: Signed quote returned by jobs/quote for this same account, API key and request. Does not replace Idempotency-Key.
+        expectedCost:
+          allOf:
+            - $ref: '#/components/schemas/USDString'
+          description: Confirmed amount to reserve, with up to nine decimal places. A changed price returns business code 40901 before reservation.
+    TaskQuoteResponse:
+      type: object
+      required: [quoteId, model, estimatedCost, maxCharge, currency, quantity, unit, expiresAt]
+      additionalProperties: false
+      properties:
+        quoteId: { type: string }
+        model: { type: string, description: Resolved endpoint model identifier. }
+        estimatedCost: { $ref: '#/components/schemas/USDString' }
+        maxCharge: { $ref: '#/components/schemas/USDString' }
+        currency: { type: string, const: USD }
+        quantity: { type: string, description: Estimated billable quantity. }
+        unit: { type: string }
+        expiresAt: { type: string, format: date-time }
+    TaskQuoteEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: '#/components/schemas/TaskQuoteResponse' }
+    CreateTaskResponse:
+      type: object
+      required: [taskId, state, estimatedCost, deadlineAt]
+      properties:
+        taskId: { type: string }
+        deadlineAt: { type: string, format: date-time, description: Server execution deadline fixed at acceptance; not a local wait timeout or result URL expiry. Idempotent replays retain the original deadline. }
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed, canceled, expired]
+          description: "`queued` for a new submission; an idempotent replay reports the original task's current state."
+        estimatedCost:
+          allOf:
+            - $ref: '#/components/schemas/USDString'
+          description: Funds held when the task is accepted and the maximum customer charge for that task. Unused funds are released and no later amount is collected above the hold.
+    TaskActionRequest:
+      type: object
+      required: [taskId]
+      additionalProperties: false
+      properties:
+        taskId: { type: string, minLength: 1 }
+    RetryTaskResponse:
+      allOf:
+        - $ref: '#/components/schemas/CreateTaskResponse'
+        - type: object
+          required: [sourceTaskId]
+          properties:
+            sourceTaskId: { type: string }
+    RetryTaskEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/RetryTaskResponse' }
+    TaskPurgeResponse:
+      type: object
+      required: [taskId, contentState, billingRetained, mediaDeletionPending]
+      properties:
+        taskId: { type: string }
+        contentState:
+          type: string
+          enum: [present, expired, purged]
+          description: >-
+            `purged` after a successful destroy, and on any idempotent repeat.
+            Still `present` means this call removed nothing and may be retried
+            later; the reason is deliberately not disclosed.
+        purgedAt:
+          type: string
+          format: date-time
+          description: Time of the **first** destroy, not of this call.
+        contentRemovedBy:
+          type: string
+          enum: [user, system]
+          description: Omitted while `contentState` is `present`.
+        billingRetained:
+          type: boolean
+          const: true
+          description: >-
+            Always true. Destroying content never changes the ledger, the
+            charged amount, or any other billing fact. It is stated explicitly
+            because it is the one thing a caller is likely to get wrong about
+            an endpoint named "purge".
+        mediaDeletionPending:
+          type: boolean
+          description: True while the background sweep has not finished removing the stored media objects.
+    TaskPurgeEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/TaskPurgeResponse' }
+    CreateTaskEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/CreateTaskResponse' }
+    TaskOutput:
+      type: object
+      additionalProperties: true
+      description: First-party result metadata. Ready assets include directly usable temporary URLs; no download-ticket request is needed. Poll again to refresh an expired URL. Temporary URLs are bearer access grants; never attach your API key when fetching them.
+      properties:
+        text: { type: string }
+        assets:
+          type: array
+          items: { $ref: '#/components/schemas/TaskOutputAsset' }
+    TaskOutputAsset:
+      type: object
+      additionalProperties: true
+      properties:
+        key: { type: string, description: Compatibility identifier for optional download-url requests. }
+        url: { type: string, format: uri, description: First-party signed GET URL, normally valid for 20 minutes and never beyond the 14-day result retention period. Absent while pending or unavailable. }
+        expiresAt: { type: string, format: date-time, description: Expiry of this URL, not the result retention deadline. }
+        mime: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        durationSeconds: { type: number }
+        bytes: { type: integer, format: int64 }
+        role: { type: string }
+        nsfw: { type: boolean }
+        pending: { type: boolean }
+        unavailable: { type: boolean }
+    TaskRecord:
+      type: object
+      required: [taskId, model, state, cost, settled, createdAt]
+      properties:
+        taskId: { type: string }
+        sourceTaskId: { type: string, description: Present when this task was created by explicit retry. }
+        model: { type: string }
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed, canceled, expired]
+        input:
+          description: Normalized model input; inline images become account-bound file URIs. Omitted after retention redaction.
+          type: object
+          additionalProperties: true
+        output: { $ref: '#/components/schemas/TaskOutput' }
+        errorCode:
+          type: string
+          description: >-
+            Stable SpicyAPI failure identifier from a closed set; never an internal diagnostic code.
+            The set is closed: any other value a client sees should be handled as
+            `upstream_failed`.
+          enum:
+            - invalid_request
+            - unsupported_combination
+            - content_rejected
+            - rate_limited
+            - upstream_unavailable
+            - generation_failed
+            - timeout
+            - invalid_asset
+            - upstream_failed
+        errorMessage: { type: string, description: 'Human-readable failure reason. When the model service reported a specific reason (for example a corrupted reference image or a copyright restriction on generated audio), that reason is returned in English with internal service names, hosts, URLs, request and task IDs, error-code suffixes and account or billing details removed; otherwise a normalized message that follows the same language selection as `msg`. `errorCode` never changes and remains the value to branch on.' }
+        cost: { $ref: '#/components/schemas/USDString' }
+        settled:
+          type: boolean
+          description: When false, `cost` is the held estimate. On success the final charge is capped at that hold; unused funds are released. Failed or expired tasks release the hold in full.
+        createdAt: { type: string, format: date-time }
+        deadlineAt: { type: string, format: date-time, description: Server execution deadline. Present in current responses; historical stored webhook events may omit it. Not the result retention or URL expiry time. }
+        completedAt: { type: string, format: date-time }
+        contentState:
+          type: string
+          enum: [present, expired, purged]
+          description: >-
+            Whether the task content is still stored, and why it is not.
+            `expired` means the retention policy removed it; `purged` means the
+            account owner destroyed it with `purgeTask`. The two are deliberately
+            distinct: telling a customer their own deletion was an expiry reads
+            as the platform losing their data.
+        contentRemovedBy:
+          type: string
+          enum: [user, system]
+          description: Present only once content has been removed. Omitted while `contentState` is `present`.
+        purgedAt:
+          type: string
+          format: date-time
+          description: Present only for a task destroyed with `purgeTask`. Expiry does not set it.
+        retention: { $ref: '#/components/schemas/TaskRetention' }
+    TaskRetention:
+      type: object
+      description: >-
+        When this task's content is scheduled to be removed, and which layer
+        decided it. Omitted for tasks created before per-task retention existed;
+        those follow the platform maximum.
+      required: [outputsExpireAt, promptsExpireAt, source]
+      properties:
+        outputsExpireAt:
+          type: string
+          format: date-time
+          description: >-
+            When the generated media objects and the result payload are removed.
+            Before the task finishes this is measured from acceptance; when the
+            task reaches a terminal state it is re-based on the completion time
+            using the same window, so it only ever moves later, never earlier.
+        promptsExpireAt:
+          type: string
+          format: date-time
+          description: When the stored request text is erased. The task row, its state, amounts and request_id remain.
+        source:
+          type: string
+          enum: [header, account, platform]
+          description: >-
+            Which layer actually constrained the value: the per-request
+            `X-Spicy-Retention` header, the account setting, or the platform
+            maximum. A request that sends the header and still sees `account`
+            has an account setting that is already shorter than it asked for.
+    TaskRecordEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/TaskRecord' }
+    LegacyWebhookPayload:
+      type: object
+      deprecated: true
+      description: Version 1 compatibility callback. New integrations must use version 2.
+      required: [task_id, model, state, cost, created_at]
+      properties:
+        task_id: { type: string }
+        model: { type: string }
+        state: { type: string, enum: [queued, running, succeeded, failed, canceled, expired] }
+        output: { type: object, additionalProperties: true }
+        error_code: { type: string }
+        error_message: { type: string }
+        cost: { $ref: '#/components/schemas/USDString' }
+        created_at: { type: string, format: date-time }
+    APIKeyTaskItem:
+      type: object
+      additionalProperties: false
+      required: [taskId, model, state, cost, settled, createdAt, deadlineAt]
+      properties:
+        taskId: { type: string }
+        model: { type: string, description: Public model identifier. }
+        state: { type: string, enum: [queued, running, succeeded, failed, canceled, expired] }
+        cost:
+          allOf:
+            - $ref: '#/components/schemas/USDString'
+          description: Final charged USD if settled; otherwise the current held estimate.
+        settled: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        deadlineAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+    APIKeyTaskListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/APIKeyTaskItem' }
+        hasMore: { type: boolean }
+        nextCursor: { type: string, description: Present only when hasMore is true. }
+    APIKeyTaskListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/APIKeyTaskListResponse' }
+    APIKeyUsageResponse:
+      type: object
+      additionalProperties: false
+      required: [from, to, currency, totalCalls, totalSpend, days, models]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        currency: { type: string, const: USD }
+        totalCalls: { type: integer, format: int64, minimum: 0 }
+        totalSpend: { $ref: '#/components/schemas/USDString' }
+        days:
+          type: array
+          items: { $ref: '#/components/schemas/UsageDayItem' }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/UsageModelItem' }
+    UsageDayItem:
+      type: object
+      additionalProperties: false
+      required: [day, calls, succeeded, failed, spend]
+      properties:
+        day: { type: string, format: date }
+        calls: { type: integer, format: int64, minimum: 0 }
+        succeeded: { type: integer, format: int64, minimum: 0 }
+        failed: { type: integer, format: int64, minimum: 0 }
+        spend: { $ref: '#/components/schemas/USDString' }
+    UsageModelItem:
+      type: object
+      additionalProperties: false
+      required: [model, calls, succeeded, failed, spend]
+      properties:
+        model: { type: string, description: Public model identifier. }
+        calls: { type: integer, format: int64, minimum: 0 }
+        succeeded: { type: integer, format: int64, minimum: 0 }
+        failed: { type: integer, format: int64, minimum: 0 }
+        spend: { $ref: '#/components/schemas/USDString' }
+    APIKeyUsageEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: '#/components/schemas/APIKeyUsageResponse' }
+    Balance:
+      type: object
+      required: [available, held, total]
+      properties:
+        funding: { $ref: '#/components/schemas/FundingOverview' }
+        available: { $ref: '#/components/schemas/USDString' }
+        held: { $ref: '#/components/schemas/USDString' }
+        total: { $ref: '#/components/schemas/USDString' }
+    BalanceEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/Balance' }
+    APIModelPrice:
+      type: object
+      required: [variant, unit, price, currency]
+      properties:
+        variant:
+          type: string
+          description: >-
+            Price tier key. Empty when the model has a single price. When one input field sets the price, it is
+            that field's value as is (for example `720p`). When several fields do, it is `field=value` pairs sorted
+            by field name and joined with `;` (for example `duration=5;resolution=720p`), with values URL-encoded;
+            `~` stands for an optional field that was not sent and has no default.
+        unit: { type: string, enum: [per_image, per_second, per_request, per_1k_tokens] }
+        price: { $ref: '#/components/schemas/USDString' }
+        regularPrice: { $ref: '#/components/schemas/USDString' }
+        offerLabel: { type: string }
+        offerPercent: { type: string }
+        offerEndsAt: { type: string, format: date-time }
+        currency: { type: string, const: USD }
+    APIModel:
+      type: object
+      required: [model, family, displayName, provider, modality, tasks, async, mature, policyTier, taskTimeoutSeconds, enabled, available, quantityField, pricing, version, availability, badges, relatedModels, updatedAt]
+      properties:
+        model:
+          type: string
+          description: Preferred callable identifier in publisher/model/task form. Image editing uses the edit suffix; previously published identifiers remain accepted.
+          example: bytedance/seedream-5.0-lite/edit
+        family:
+          type: string
+          description: Stable product-family identifier; endpoint variants are listed in `tasks` and expressed by `inputSchema`.
+        displayName: { type: string }
+        provider:
+          type: string
+          description: Model creator/author identifier, such as the research lab that built the model.
+        modality: { type: string, enum: [image, video, audio, text] }
+        tasks:
+          type: array
+          items: { type: string }
+          description: >-
+            The internal task classification of this one endpoint. Always exactly one element, and it is
+            not always the suffix of `model`: image editing endpoints are published as `.../edit` but
+            classified as `image-to-image`, because renaming the call did not reclassify the work. Use
+            `model` to call, and `tasks[0]` only to group or filter. Other values match their suffix:
+            `text-to-image`, `text-to-video`, `image-to-video`, `reference-to-video`, `video-edit`,
+            `video-extend`, `video-analyze`, `character-animation`, `speech-to-text`, `chat`. New values
+            appear as models are added, so treat the set as open.
+        async: { type: boolean }
+        mature:
+          type: boolean
+          description: Informational model-creator capability metadata only. It does not participate in authorization, availability decisions, or request rejection.
+        policyTier:
+          type: string
+          enum: [unrestricted, borderline, softened, filtered, unspecified]
+          description: >-
+            Informational model-creator policy metadata only. It does not participate in authorization,
+            availability decisions, or request rejection. `unrestricted`: the model adds no refusal layer of
+            its own. `borderline`: it accepts some mature material and may still refuse. `softened`: it does
+            not refuse and does not fail — it quietly returns a tamer result, and that task settles and is
+            charged like any other success. `filtered`: it refuses mature material outright, which surfaces as
+            a `content_rejected` failure. `unspecified`: no tier has been recorded for this model. Treat the
+            set as open: a value you do not recognise must not break your client.
+        toolkit:
+          type: string
+          enum: [subject-swap]
+          description: Which toolkit family this model belongs to (subject-swap). Informational classification for catalogue grouping only; it does not participate in routing, pricing or authorization. Absent when the model is not part of a toolkit.
+        taskTimeoutSeconds:
+          type: integer
+          minimum: 1
+          description: Absolute platform execution deadline before timeout/refund; not media output duration.
+        maxOutputDurationSeconds:
+          type: integer
+          minimum: 1
+          description: >-
+            Maximum output duration the model schema allows, taken from the `maximum` of its
+            `duration_seconds` property; omitted when that property is absent or has no declared
+            maximum. Distinct from `taskTimeoutSeconds`, which is the platform execution deadline.
+        enabled: { type: boolean }
+        available: { type: boolean }
+        quantityField: { type: string }
+        pricing: { type: array, items: { $ref: '#/components/schemas/APIModelPrice' } }
+        startingPrice: { $ref: '#/components/schemas/APIModelPrice' }
+        inputSchema:
+          type: object
+          description: >-
+            JSON Schema draft 2020-12 used by `createTask.input` validation and Playground rendering.
+            Standard JSON Schema keywords validate. Presentation hints live only in a per-property `x-ui`
+            object whose keys are snake_case and drawn from a closed set: `widget`, `order`, `label`,
+            `placeholder`, `rows`, `step`, `unit`, `accept`, `max_size_mb`, `advanced`, `primary`,
+            `affects_price`, `visible_when`, `enum_labels`. `x-ui.order` is the only source of field
+            order (descending first). `x-ui.widget` is one of `textarea`, `text`, `upload`,
+            `multi-upload`, `select`, `radio`, `slider`, `number`, `switch`, `json`, `object-list`,
+            `chat-messages`, `hidden`. Root-level composition is limited to `anyOf`, where every branch
+            contains only `required`, and `allOf`, where each branch is `if` (`required` or
+            `properties.*.const`) plus `then` (`required`); `oneOf`, `not` and `dependentSchemas` never
+            appear. Unknown hints must be ignored.
+          additionalProperties: true
+        version:
+          type: string
+          description: Public model-catalog version label used to detect schema or metadata changes.
+        availability:
+          type: string
+          enum: [planned, available, preview, maintenance]
+        badges:
+          type: array
+          description: Closed capability and licensing vocabulary; clients should ignore unknown future IDs.
+          items:
+            type: string
+            enum: [commercial_use, no_watermark, commercial_restricted, reference_input, audio_output, streaming, fast_tier, high_resolution, long_context, mature_capable, policy_unrestricted, policy_borderline]
+        relatedModels:
+          type: array
+          description: Curated model identifiers suitable for alternatives or workflow steps.
+          items: { type: string }
+        examples:
+          type: array
+          description: Inputs validated against this model's current input schema.
+          items: { $ref: '#/components/schemas/APIModelExample' }
+        updatedAt: { type: string, format: date-time }
+    APIModelExample:
+      type: object
+      required: [id, input, sortWeight]
+      properties:
+        id: { type: string }
+        input: { type: object, additionalProperties: true }
+        sortWeight: { type: integer }
+    APIModelList:
+      type: object
+      required: [total, items]
+      properties:
+        total: { type: integer, minimum: 0 }
+        items: { type: array, items: { $ref: '#/components/schemas/APIModel' } }
+    ModelEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/APIModel' }
+    PublicCatalogEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/PublicCatalogList' }
+    PublicCatalogList:
+      type: object
+      required: [locale, items, total]
+      properties:
+        locale: { type: string, description: The locale the copy was resolved to. }
+        total: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PublicCatalogItem' }
+    PublicCatalogItem:
+      type: object
+      description: >-
+        Evaluation view of one endpoint. Additional presentation fields are
+        returned and documented in console-openapi.yaml.
+      required: [model, slug, family, displayName, provider, modality, tasks, status, callable]
+      properties:
+        model:
+          type: string
+          description: >-
+            Same value as `slug`, under the field name `/api/v1/models` uses.
+            This is the value `createTask.model` takes.
+        slug: { type: string }
+        aliases:
+          type: array
+          items: { type: string }
+          description: Previously published identifiers that still resolve to this endpoint.
+        family: { type: string }
+        familyPageSlug: { type: string }
+        familyDisplayName: { type: string }
+        displayName: { type: string }
+        provider:
+          type: string
+          description: The model's creator, for example `ByteDance`. Never an execution channel.
+        modality: { type: string, enum: [image, video, audio, text] }
+        tasks:
+          type: array
+          items: { type: string }
+          description: Same values and meaning as APIModel.tasks, including the `edit` / `image-to-image` split.
+        mature: { type: boolean }
+        policyTier: { type: string, enum: [unrestricted, borderline, softened, filtered, unspecified], description: 'Same values and meaning as APIModel.policyTier. Treat the set as open.' }
+        toolkit: { type: string, enum: [subject-swap], description: Which toolkit family this model belongs to (subject-swap). Informational classification for catalogue grouping only; it does not participate in routing, pricing or authorization. Absent when the model is not part of a toolkit. }
+        async: { type: boolean }
+        status:
+          type: string
+          enum: [published, live, paused]
+          description: Operator intent. `live` is the only status that can be callable.
+        callable:
+          type: boolean
+          description: >-
+            Whether a fully priced, routable execution path exists right now.
+            A callable endpoint always has a price; an endpoint without a price
+            is never callable.
+        price:
+          oneOf:
+            - $ref: '#/components/schemas/PublicCatalogPrice'
+            - type: 'null'
+          description: >-
+            Standard-rate starting price, or absent when the endpoint is not
+            currently sellable. It is never reported as `0`.
+    PublicCatalogPrice:
+      type: object
+      required: [amount, unit, tiers]
+      properties:
+        amount:
+          type: string
+          description: >-
+            Lowest tier's unit price as a decimal string. Decimal strings, not
+            numbers, because these values are displayed and binary floats
+            cannot represent them exactly.
+        unit: { type: string, description: 'Billing unit identifier, for example per_image or per_second.' }
+        variant: { type: string, description: The tier this price belongs to; absent when the model has one tier. }
+        tiers:
+          type: integer
+          description: Number of currently effective tiers. Greater than one means this is a starting price.
+        regularAmount: { type: string, description: Pre-discount price, present only when a customer offer applies. }
+        offerLabel: { type: string }
+        offerPercent: { type: string }
+        offerEndsAt: { type: string, format: date-time }
+        perMillionTokens:
+          type: object
+          description: Standard per-million-token prices for text models.
+          required: [input, output]
+          properties:
+            input: { type: string }
+            cachedInput: { type: string }
+            output: { type: string }
+            cacheWrite: { type: string }
+        listPrice:
+          type: object
+          description: >-
+            The model creator's own published price, present only when ours is
+            at least 1% lower. It is not our pre-discount price.
+        variants:
+          type: array
+          description: >-
+            Every priced tier of a per-second, per-image or per-request model, cheapest first (the first
+            entry is the starting price). Absent for per-token models. `variant` is the raw tier key: a
+            single value such as `720p`, or a compound key such as `generate_audio=false;resolution=1080p`.
+          items:
+            type: object
+            required: [variant, amount, unit]
+            properties:
+              variant: { type: string }
+              amount: { type: string }
+              regularAmount: { type: string }
+              unit: { type: string }
+              listPrice:
+                type: object
+                description: This tier's own reference price, under the same rules as listPrice above.
+    ModelListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/APIModelList' }
+    UploadURLRequest:
+      type: object
+      required: [contentType, bytes]
+      additionalProperties: false
+      properties:
+        contentType: { type: string, enum: [image/jpeg, image/png, image/webp, image/gif, video/mp4, video/webm, audio/mpeg, audio/wav] }
+        bytes: { type: integer, minimum: 1, maximum: 94371840, description: Images are limited to 10 MiB; supported audio/video to 90 MiB. }
+    UploadURLResponse:
+      type: object
+      required: [fileId, key, uploadUrl, method, headers, expiresAt, maxBytes]
+      properties:
+        fileId: { type: string, pattern: '^fil_' }
+        key: { type: string, pattern: '^spicy://f/fil_', description: Compatibility alias for the final URI; unusable until commit succeeds. }
+        uploadUrl: { type: string, format: uri }
+        method: { type: string, const: PUT }
+        headers: { type: object, additionalProperties: { type: string } }
+        expiresAt: { type: string, format: date-time }
+        maxBytes: { type: integer, minimum: 1 }
+    UploadURLEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/UploadURLResponse' }
+    FileCommitResponse:
+      type: object
+      required: [fileId, status, bytes, contentType, sha256, uri, expiresAt]
+      properties:
+        fileId: { type: string, pattern: '^fil_' }
+        status: { type: string, const: ready }
+        bytes: { type: integer, minimum: 1 }
+        contentType: { type: string, enum: [image/jpeg, image/png, image/webp, image/gif, video/mp4, video/webm, audio/mpeg, audio/wav] }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        uri: { type: string, pattern: '^spicy://f/fil_' }
+        expiresAt: { type: string, format: date-time }
+        durationSeconds: { type: string, description: Measured audio/video duration in seconds. }
+        width: { type: integer, minimum: 0 }
+        height: { type: integer, minimum: 0 }
+    FileCommitEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/FileCommitResponse' }
+    DownloadURLRequest:
+      type: object
+      required: [taskId]
+      additionalProperties: false
+      properties:
+        taskId: { type: string, minLength: 1 }
+        key: { type: string, description: Optional output key; empty selects the first output. }
+    DownloadURLResponse:
+      type: object
+      required: [key, url, expiresAt]
+      properties:
+        key: { type: string }
+        url: { type: string, format: uri }
+        expiresAt: { type: string, format: date-time }
+    DownloadURLEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeBase'
+        - type: object
+          required: [data]
+          properties:
+            code: { type: integer, const: 200 }
+            msg: { type: string, const: success }
+            data: { $ref: '#/components/schemas/DownloadURLResponse' }
+    USDString:
+      type: string
+      pattern: '^-?[0-9]+(?:\.[0-9]+)?$'
+      description: Decimal USD amount encoded as a string to avoid binary floating-point loss.
+
+    # ── OpenAI / Anthropic compatible shapes ───────────────────────────────
+    OpenAIErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type, code]
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, permission_error, insufficient_quota, rate_limit_error, server_error]
+            param: { type: [string, 'null'] }
+            code:
+              type: string
+              description: Stable machine-readable reason, for example `invalid_request`, `invalid_api_key`, `insufficient_balance`, `model_not_allowed`, `model_unavailable`, `rate_limit_exceeded`.
+    AnthropicErrorBody:
+      type: object
+      required: [type, error]
+      properties:
+        type: { type: string, const: error }
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, billing_error, permission_error, not_found_error, request_too_large, rate_limit_error, api_error, overloaded_error]
+            message: { type: string }
+    OpenAIModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, created, owned_by]
+            properties:
+              id: { type: string, description: SpicyAPI model identifier; may contain slashes. }
+              object: { type: string, const: model }
+              created: { type: integer, description: Unix seconds of the last catalog update. }
+              owned_by: { type: string, description: Model publisher. }
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string }
+        messages:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [role]
+            properties:
+              role: { type: string }
+              content:
+                oneOf:
+                  - { type: [string, 'null'] }
+                  - { type: array, items: { type: object, additionalProperties: true } }
+              tool_call_id: { type: string }
+              tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+              reasoning_content:
+                type: string
+                description: Optional assistant reasoning text; availability and message roles follow the selected model input schema.
+            additionalProperties: true
+        stream: { type: boolean, default: false }
+        max_tokens: { type: integer }
+        max_completion_tokens: { type: integer, description: Alias of `max_tokens`. }
+        temperature: { type: number }
+        top_p: { type: number }
+        tools: { type: array, items: { type: object, additionalProperties: true } }
+        tool_choice: { oneOf: [{ type: string }, { type: object, additionalProperties: true }] }
+        response_format: { type: object, additionalProperties: true }
+      additionalProperties:
+        description: Forwarded to the model input schema and rejected when undeclared.
+    ChatCompletion:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id: { type: string }
+        object: { type: string, const: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            required: [index, message, finish_reason]
+            properties:
+              index: { type: integer }
+              message:
+                type: object
+                properties:
+                  role: { type: string }
+                  content: { type: [string, 'null'] }
+                  refusal: { type: string }
+                  reasoning_content:
+                    type: string
+                    description: Optional reasoning text returned by models that expose it. Streaming chunks use the same field in delta.
+                  tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+              finish_reason: { type: string }
+              logprobs: { type: 'null' }
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+            prompt_tokens_details:
+              type: object
+              properties:
+                cached_tokens: { type: integer }
+                cache_creation_input_tokens: { type: integer }
+                cache_read_input_tokens: { type: integer }
+            completion_tokens_details:
+              type: object
+              properties:
+                reasoning_tokens:
+                  type: integer
+                  description: Included in completion_tokens; do not add it again when calculating usage.
+    ResponsesRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          oneOf:
+            - { type: string }
+            - { type: array, items: { type: object } }
+        instructions: { type: string }
+        max_output_tokens: { type: integer }
+        temperature: { type: number }
+        top_p: { type: number }
+        tools: { type: array, items: { type: object } }
+        tool_choice: { oneOf: [{ type: string }, { type: object }] }
+        text: { type: object }
+        reasoning: { type: object, properties: { effort: { type: string } } }
+        stream: { type: boolean, default: false }
+    ResponseObject:
+      type: object
+      required: [id, object, created_at, status, model, output]
+      properties:
+        id: { type: string }
+        object: { type: string, const: response }
+        created_at: { type: integer }
+        status: { type: string, enum: [completed, incomplete, in_progress] }
+        model: { type: string }
+        output:
+          type: array
+          items:
+            type: object
+            required: [id, type, status]
+            properties:
+              id: { type: string }
+              type: { type: string, enum: [message, function_call] }
+              status: { type: string }
+              role: { type: string }
+              content:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type: { type: string, const: output_text }
+                    text: { type: string }
+                    annotations: { type: array, items: { type: object } }
+              call_id: { type: string }
+              name: { type: string }
+              arguments: { type: string }
+        error: { type: 'null' }
+        incomplete_details:
+          type: [object, 'null']
+          properties:
+            reason: { type: string }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            total_tokens: { type: integer }
+    GeminiGenerateContentRequest:
+      type: object
+      required: [contents]
+      description: Google Gemini `generateContent` request. Which generation parameters a model accepts comes from that model's `inputSchema` in `/v1/models` and the catalog; unsupported parameters return 400.
+      properties:
+        contents:
+          type: array
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, model] }
+              parts:
+                type: array
+                items:
+                  type: object
+                  description: One of `text`, `inlineData {mimeType,data}`, `fileData {mimeType,fileUri}`, `functionCall {name,args}`, `functionResponse {name,response}`.
+        systemInstruction: { type: object }
+        tools: { type: array, items: { type: object } }
+        toolConfig: { type: object }
+        generationConfig:
+          type: object
+          properties:
+            temperature: { type: number }
+            topP: { type: number }
+            maxOutputTokens: { type: integer }
+            stopSequences: { type: array, items: { type: string } }
+            responseMimeType: { type: string }
+            responseSchema: { type: object }
+            thinkingConfig: { type: object }
+    GeminiGenerateContentResponse:
+      type: object
+      properties:
+        candidates:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              content:
+                type: object
+                properties:
+                  role: { type: string }
+                  parts: { type: array, items: { type: object } }
+              finishReason: { type: string }
+        usageMetadata:
+          type: object
+          properties:
+            promptTokenCount: { type: integer }
+            candidatesTokenCount: { type: integer }
+            totalTokenCount: { type: integer }
+            cachedContentTokenCount: { type: integer }
+            thoughtsTokenCount: { type: integer }
+        modelVersion: { type: string, description: The SpicyAPI model identifier. }
+        responseId: { type: string }
+    GeminiErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, status]
+          properties:
+            code: { type: integer }
+            message: { type: string }
+            status: { type: string }
+    AnthropicMessageRequest:
+      type: object
+      required: [model, messages, max_tokens]
+      properties:
+        model: { type: string }
+        system:
+          oneOf:
+            - { type: string }
+            - { type: array, items: { type: object } }
+        messages:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              content:
+                oneOf:
+                  - { type: string }
+                  - { type: array, items: { type: object } }
+        max_tokens: { type: integer }
+        temperature: { type: number }
+        top_p: { type: number }
+        stop_sequences: { type: array, items: { type: string } }
+        tools: { type: array, items: { type: object } }
+        tool_choice: { type: object }
+        stream: { type: boolean, default: false }
+    AnthropicMessage:
+      type: object
+      required: [id, type, role, model, content, stop_reason, usage]
+      properties:
+        id: { type: string }
+        type: { type: string, const: message }
+        role: { type: string, const: assistant }
+        model: { type: string }
+        content:
+          type: array
+          items:
+            type: object
+            required: [type]
+            properties:
+              type: { type: string, enum: [text, tool_use] }
+              text: { type: string }
+              id: { type: string }
+              name: { type: string }
+              input: { type: object }
+        stop_reason: { type: string, enum: [end_turn, max_tokens, tool_use] }
+        stop_sequence: { type: 'null' }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+    VideoCreateRequest:
+      type: object
+      required: [model, prompt]
+      additionalProperties: false
+      properties:
+        model: { type: string, description: Video endpoint identifier from `/v1/models`. }
+        prompt: { type: string }
+        input_reference: { type: string, description: Reference image URL; mapped to the model's `image_url` / `image_urls`. }
+        seconds:
+          oneOf: [{ type: string }, { type: integer }]
+          description: Clip length in seconds; mapped to `duration_seconds`.
+        size: { type: string, pattern: '^[0-9]+x[0-9]+$', description: 'WIDTHxHEIGHT, mapped to `resolution` / `aspect_ratio` (or `width` / `height`).' }
+    Video:
+      type: object
+      required: [id, object, model, status, progress, created_at]
+      properties:
+        id: { type: string, description: Task identifier; also accepted by `/api/v1/jobs/recordInfo`. }
+        object: { type: string, const: video }
+        model: { type: string }
+        status: { type: string, enum: [queued, in_progress, completed, failed] }
+        progress: { type: integer, minimum: 0, maximum: 100, description: 100 when completed, otherwise 0; no fabricated intermediate values. }
+        created_at: { type: integer }
+        completed_at: { type: integer }
+        seconds: { type: string }
+        size: { type: string }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spicyapi"
+dynamic = ["version"]
+description = "Official Python client for SpicyAPI — image, video and text generation behind one API."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "SpicyAPI" }]
+keywords = ["spicyapi", "image-generation", "video-generation", "ai", "api-client"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+# Zero runtime dependencies is deliberate: this package lands inside somebody else's existing
+# dependency tree, and every extra constraint is one more chance of a conflict.
+dependencies = []
+
+[project.urls]
+Homepage = "https://spicyapi.ai"
+Documentation = "https://docs.spicyapi.ai"
+Source = "https://github.com/Spicy-API/spicy-python"
+Issues = "https://spicyapi.ai/contact"
+
+[tool.hatch.version]
+# _client.py is the single source of the version (__init__.py merely re-exports it). Writing it in
+# two places guarantees drift, and the symptom of that drift is a PyPI version that disagrees with
+# __version__.
+path = "src/spicyapi/_client.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spicyapi"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/spicyapi", "tests", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
