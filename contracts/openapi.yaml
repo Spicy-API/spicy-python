@@ -643,7 +643,7 @@ paths:
         bytes with PUT and copy every returned header. Supported media types are
         JPEG, PNG, WebP and GIF images (10 MiB), or MP4/WebM video and
         MP3/WAV audio (90 MiB, at most 600 seconds). Audio/video commit verifies
-        format and measurable duration; it does not inspect adult content. After PUT,
+        format and measurable duration; it does not apply a platform content filter. After PUT,
         call the file commit endpoint and use its spicy:// URI in task input.
       requestBody:
         required: true
@@ -1281,6 +1281,12 @@ components:
             audio/video are not accepted; use HTTPS or file uploads instead. Inline images
             are stored as account-bound uploaded files; returned input contains file URIs,
             never the original Base64 bytes. Quote validation does not upload or reserve funds.
+            If the model's inputSchema declares `seed` and you omit it, we pick a random seed for
+            this task, so two identical requests do not come back with the same output. The chosen
+            seed is returned in the task's `input`; pass it back to hold the draw steady (a fixed
+            seed keeps runs comparable, it does not guarantee an identical result). On the few
+            models that cannot honour `seed` on every request, we still vary it where it applies
+            but do not echo it. A `seed` you send yourself is always used as given.
           additionalProperties: true
         callBackUrl:
           type: string
@@ -1440,7 +1446,10 @@ components:
           type: string
           enum: [queued, running, succeeded, failed, canceled, expired]
         input:
-          description: Normalized model input; inline images become account-bound file URIs. Omitted after retention redaction.
+          description: >-
+            Normalized model input; inline images become account-bound file URIs. Includes the
+            random `seed` we picked when you omitted one (see CreateTaskRequest.input). Omitted
+            after retention redaction.
           type: object
           additionalProperties: true
         output: { $ref: '#/components/schemas/TaskOutput' }
@@ -1687,11 +1696,11 @@ components:
           description: >-
             Informational model-creator policy metadata only. It does not participate in authorization,
             availability decisions, or request rejection. `unrestricted`: the model adds no refusal layer of
-            its own. `borderline`: it accepts some mature material and may still refuse. `softened`: it does
-            not refuse and does not fail — it quietly returns a tamer result, and that task settles and is
-            charged like any other success. `filtered`: it refuses mature material outright, which surfaces as
-            a `content_rejected` failure. `unspecified`: no tier has been recorded for this model. Treat the
-            set as open: a value you do not recognise must not break your client.
+            its own. `borderline`: its own policy lets some requests through and may still decline others.
+            `softened`: it does not refuse and does not fail — it quietly returns a toned-down result, and that
+            task settles and is charged like any other success. `filtered`: it declines requests its own policy
+            restricts, which surfaces as a `content_rejected` failure. `unspecified`: no tier has been recorded
+            for this model. Treat the set as open: a value you do not recognise must not break your client.
         toolkit:
           type: string
           enum: [subject-swap]
